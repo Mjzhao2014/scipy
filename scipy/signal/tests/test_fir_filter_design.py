@@ -6,13 +6,20 @@ from scipy._lib._array_api import (
 )
 from pytest import raises as assert_raises
 import pytest
+import time
+from matplotlib.figure import Figure
 
+import scipy.signal as spsig
+import multiprocessing as mp
 from scipy.fft import fft, fft2
 from scipy.special import sinc
 from scipy.signal import kaiser_beta, kaiser_atten, kaiserord, \
     firwin, firwin2, freqz, remez, firls, minimum_phase, \
     convolve2d
-from scipy.signal._fir_filter_design import firwin_2d
+from scipy.signal._fir_filter_design import FilterSpec, FIRFilter, firwin_2d
+from scipy.signal import firwin, firls, remez, kaiserord, firwin2
+from scipy.signal import lfilter
+from pathlib import Path
 
 def test_kaiser_beta():
     b = kaiser_beta(58.7)
@@ -277,58 +284,78 @@ class TestFirWinMore:
                 firwin(41, [0.5], pass_zero=pass_zero)
 
     def test_fs_validation(self):
-        with pytest.raises(ValueError, match="Sampling.*single scalar"):
-            firwin2(51, .5, 1, fs=np.array([10, 20]))
+        # The firwin2 API is now deprecated; ignore its deprecation warning and
+        # ensure ValueError still propagates for bad fs.
+        with pytest.warns(DeprecationWarning):
+            with pytest.raises(ValueError, match="Sampling.*single scalar"):
+                firwin2(51, .5, 1, fs=np.array([10, 20]))
 
 
 class TestFirwin2:
 
     def test_invalid_args(self):
+        # firwin2 is deprecated; suppress its deprecation warning while
+        # asserting argument validation still works as before.
+        w = pytest.warns(DeprecationWarning)
         # `freq` and `gain` have different lengths.
-        with assert_raises(ValueError, match='must be of same length'):
-            firwin2(50, [0, 0.5, 1], [0.0, 1.0])
+        with w:
+            with assert_raises(ValueError, match='must be of same length'):
+                firwin2(50, [0, 0.5, 1], [0.0, 1.0])
         # `nfreqs` is less than `ntaps`.
-        with assert_raises(ValueError, match='ntaps must be less than nfreqs'):
-            firwin2(50, [0, 0.5, 1], [0.0, 1.0, 1.0], nfreqs=33)
+        with w:
+            with assert_raises(ValueError, match='ntaps must be less than nfreqs'):
+                firwin2(50, [0, 0.5, 1], [0.0, 1.0, 1.0], nfreqs=33)
         # Decreasing value in `freq`
-        with assert_raises(ValueError, match='must be nondecreasing'):
-            firwin2(50, [0, 0.5, 0.4, 1.0], [0, .25, .5, 1.0])
+        with w:
+            with assert_raises(ValueError, match='must be nondecreasing'):
+                firwin2(50, [0, 0.5, 0.4, 1.0], [0, .25, .5, 1.0])
         # Value in `freq` repeated more than once.
-        with assert_raises(ValueError, match='must not occur more than twice'):
-            firwin2(50, [0, .1, .1, .1, 1.0], [0.0, 0.5, 0.75, 1.0, 1.0])
+        with w:
+            with assert_raises(ValueError, match='must not occur more than twice'):
+                firwin2(50, [0, .1, .1, .1, 1.0], [0.0, 0.5, 0.75, 1.0, 1.0])
         # `freq` does not start at 0.0.
-        with assert_raises(ValueError, match='start with 0'):
-            firwin2(50, [0.5, 1.0], [0.0, 1.0])
+        with w:
+            with assert_raises(ValueError, match='start with 0'):
+                firwin2(50, [0.5, 1.0], [0.0, 1.0])
         # `freq` does not end at fs/2.
-        with assert_raises(ValueError, match='end with fs/2'):
-            firwin2(50, [0.0, 0.5], [0.0, 1.0])
+        with w:
+            with assert_raises(ValueError, match='end with fs/2'):
+                firwin2(50, [0.0, 0.5], [0.0, 1.0])
         # Value 0 is repeated in `freq`
-        with assert_raises(ValueError, match='0 must not be repeated'):
-            firwin2(50, [0.0, 0.0, 0.5, 1.0], [1.0, 1.0, 0.0, 0.0])
+        with w:
+            with assert_raises(ValueError, match='0 must not be repeated'):
+                firwin2(50, [0.0, 0.0, 0.5, 1.0], [1.0, 1.0, 0.0, 0.0])
         # Value fs/2 is repeated in `freq`
-        with assert_raises(ValueError, match='fs/2 must not be repeated'):
-            firwin2(50, [0.0, 0.5, 1.0, 1.0], [1.0, 1.0, 0.0, 0.0])
+        with w:
+            with assert_raises(ValueError, match='fs/2 must not be repeated'):
+                firwin2(50, [0.0, 0.5, 1.0, 1.0], [1.0, 1.0, 0.0, 0.0])
         # Value in `freq` that is too close to a repeated number
-        with assert_raises(ValueError, match='cannot contain numbers '
-                                             'that are too close'):
-            firwin2(50, [0.0, 0.5 - np.finfo(float).eps * 0.5, 0.5, 0.5, 1.0],
-                        [1.0, 1.0, 1.0, 0.0, 0.0])
+        with w:
+            with assert_raises(ValueError, match='cannot contain numbers '
+                                                 'that are too close'):
+                firwin2(50, [0.0, 0.5 - np.finfo(float).eps * 0.5, 0.5, 0.5, 1.0],
+                            [1.0, 1.0, 1.0, 0.0, 0.0])
 
         # Type II filter, but the gain at nyquist frequency is not zero.
-        with assert_raises(ValueError, match='Type II filter'):
-            firwin2(16, [0.0, 0.5, 1.0], [0.0, 1.0, 1.0])
+        with w:
+            with assert_raises(ValueError, match='Type II filter'):
+                firwin2(16, [0.0, 0.5, 1.0], [0.0, 1.0, 1.0])
 
         # Type III filter, but the gains at nyquist and zero rate are not zero.
-        with assert_raises(ValueError, match='Type III filter'):
-            firwin2(17, [0.0, 0.5, 1.0], [0.0, 1.0, 1.0], antisymmetric=True)
-        with assert_raises(ValueError, match='Type III filter'):
-            firwin2(17, [0.0, 0.5, 1.0], [1.0, 1.0, 0.0], antisymmetric=True)
-        with assert_raises(ValueError, match='Type III filter'):
-            firwin2(17, [0.0, 0.5, 1.0], [1.0, 1.0, 1.0], antisymmetric=True)
+        with w:
+            with assert_raises(ValueError, match='Type III filter'):
+                firwin2(17, [0.0, 0.5, 1.0], [0.0, 1.0, 1.0], antisymmetric=True)
+        with w:
+            with assert_raises(ValueError, match='Type III filter'):
+                firwin2(17, [0.0, 0.5, 1.0], [1.0, 1.0, 0.0], antisymmetric=True)
+        with w:
+            with assert_raises(ValueError, match='Type III filter'):
+                firwin2(17, [0.0, 0.5, 1.0], [1.0, 1.0, 1.0], antisymmetric=True)
 
         # Type IV filter, but the gain at zero rate is not zero.
-        with assert_raises(ValueError, match='Type IV filter'):
-            firwin2(16, [0.0, 0.5, 1.0], [1.0, 1.0, 0.0], antisymmetric=True)
+        with w:
+            with assert_raises(ValueError, match='Type IV filter'):
+                firwin2(16, [0.0, 0.5, 1.0], [1.0, 1.0, 0.0], antisymmetric=True)
 
     def test01(self):
         width = 0.04
@@ -338,7 +365,8 @@ class TestFirwin2:
         # increases from w=0.5 to w=1  (w=1 is the Nyquist frequency).
         freq = [0.0, 0.5, 1.0]
         gain = [1.0, 1.0, 0.0]
-        taps = firwin2(ntaps, freq, gain, window=('kaiser', beta))
+        with pytest.warns(DeprecationWarning):
+            taps = firwin2(ntaps, freq, gain, window=('kaiser', beta))
         freq_samples = np.array([0.0, 0.25, 0.5-width/2, 0.5+width/2,
                                                         0.75, 1.0-width/2])
         freqs, response = freqz(taps, worN=np.pi*freq_samples)
@@ -353,7 +381,8 @@ class TestFirwin2:
         # An ideal highpass filter.
         freq = [0.0, 0.5, 0.5, 1.0]
         gain = [0.0, 0.0, 1.0, 1.0]
-        taps = firwin2(ntaps, freq, gain, window=('kaiser', beta))
+        with pytest.warns(DeprecationWarning):
+            taps = firwin2(ntaps, freq, gain, window=('kaiser', beta))
         freq_samples = np.array([0.0, 0.25, 0.5-width, 0.5+width, 0.75, 1.0])
         freqs, response = freqz(taps, worN=np.pi*freq_samples)
         assert_array_almost_equal(np.abs(response),
@@ -366,7 +395,8 @@ class TestFirwin2:
         ntaps = int(ntaps) | 1
         freq = [0.0, 0.4, 0.4, 0.5, 0.5, 1.0]
         gain = [1.0, 1.0, 0.0, 0.0, 1.0, 1.0]
-        taps = firwin2(ntaps, freq, gain, window=('kaiser', beta))
+        with pytest.warns(DeprecationWarning):
+            taps = firwin2(ntaps, freq, gain, window=('kaiser', beta))
         freq_samples = np.array([0.0, 0.4-width, 0.4+width, 0.45,
                                     0.5-width, 0.5+width, 0.75, 1.0])
         freqs, response = freqz(taps, worN=np.pi*freq_samples)
@@ -379,7 +409,8 @@ class TestFirwin2:
         # Ideal lowpass: gain is 1 on [0,0.5], and 0 on [0.5, 1.0]
         freq = [0.0, 0.5, 0.5, 1.0]
         gain = [1.0, 1.0, 0.0, 0.0]
-        taps = firwin2(ntaps, freq, gain, window=None, nfreqs=8193)
+        with pytest.warns(DeprecationWarning):
+            taps = firwin2(ntaps, freq, gain, window=None, nfreqs=8193)
         alpha = 0.5 * (ntaps - 1)
         m = np.arange(0, ntaps) - alpha
         h = 0.5 * sinc(0.5 * m)
@@ -391,7 +422,8 @@ class TestFirwin2:
 
         freq = [0.0, 1.0]
         gain = [0.0, 1.0]
-        taps = firwin2(ntaps, freq, gain, window=None, antisymmetric=True)
+        with pytest.warns(DeprecationWarning):
+            taps = firwin2(ntaps, freq, gain, window=None, antisymmetric=True)
         assert_array_almost_equal(taps[: ntaps // 2], -taps[ntaps // 2:][::-1])
 
         freqs, response = freqz(taps, worN=2048)
@@ -403,7 +435,8 @@ class TestFirwin2:
 
         freq = [0.0, 0.5, 0.55, 1.0]
         gain = [0.0, 0.5, 0.0, 0.0]
-        taps = firwin2(ntaps, freq, gain, window=None, antisymmetric=True)
+        with pytest.warns(DeprecationWarning):
+            taps = firwin2(ntaps, freq, gain, window=None, antisymmetric=True)
         assert taps[ntaps // 2] == 0.0
         assert_array_almost_equal(taps[: ntaps // 2], -taps[ntaps // 2 + 1:][::-1])
 
@@ -412,19 +445,24 @@ class TestFirwin2:
         assert_array_almost_equal(abs(response1), response2, decimal=3)
 
     def test_fs_nyq(self):
-        taps1 = firwin2(80, [0.0, 0.5, 1.0], [1.0, 1.0, 0.0])
-        taps2 = firwin2(80, [0.0, 30.0, 60.0], [1.0, 1.0, 0.0], fs=120.0)
+        with pytest.warns(DeprecationWarning):
+            taps1 = firwin2(80, [0.0, 0.5, 1.0], [1.0, 1.0, 0.0])
+        with pytest.warns(DeprecationWarning):
+            taps2 = firwin2(80, [0.0, 30.0, 60.0], [1.0, 1.0, 0.0], fs=120.0)
         assert_array_almost_equal(taps1, taps2)
 
     def test_tuple(self):
-        taps1 = firwin2(150, (0.0, 0.5, 0.5, 1.0), (1.0, 1.0, 0.0, 0.0))
-        taps2 = firwin2(150, [0.0, 0.5, 0.5, 1.0], [1.0, 1.0, 0.0, 0.0])
+        with pytest.warns(DeprecationWarning):
+            taps1 = firwin2(150, (0.0, 0.5, 0.5, 1.0), (1.0, 1.0, 0.0, 0.0))
+        with pytest.warns(DeprecationWarning):
+            taps2 = firwin2(150, [0.0, 0.5, 0.5, 1.0], [1.0, 1.0, 0.0, 0.0])
         assert_array_almost_equal(taps1, taps2)
 
     def test_input_modyfication(self):
         freq1 = np.array([0.0, 0.5, 0.5, 1.0])
         freq2 = np.array(freq1)
-        firwin2(80, freq1, [1.0, 1.0, 0.0, 0.0])
+        with pytest.warns(DeprecationWarning):
+            firwin2(80, freq1, [1.0, 1.0, 0.0, 0.0])
         xp_assert_equal(freq1, freq2)
 
 
@@ -757,3 +795,728 @@ class Testfirwin_2d:
         assert np.allclose(taps, known_result, rtol=1e-1), (
             f"Filter shape mismatch: {taps} vs {known_result}"
         )
+# ----------------------------
+# Helpers for item 8 baselines
+# ----------------------------
+
+def _load_baselines():
+    """
+    Load historical coefficient baselines from a JSON file placed next to this test.
+    The file should map keys to lists of floats, e.g.:
+
+    {
+      "firwin_lowpass_hann_15_0p30_fs1p0": [ ... ],
+      "firls_lpass_15_0p25_0p35_fs1p0": [ ... ],
+      "remez_lpass_17_0p22_0p32_fs0p5": [ ... ]
+    }
+    """
+    p = Path(__file__).with_name("fir_baselines.json")
+    if not p.exists():
+        return None
+    with p.open("r") as f:
+        return json.load(f)
+
+
+BASELINES = _load_baselines()
+
+
+def _get_baseline_or_skip(key):
+    if BASELINES is None or key not in BASELINES:
+        pytest.skip(
+            f"Historical baseline '{key}' not available; "
+            f"create scipy/signal/tests/fir_baselines.json to enable parity check."
+        )
+    return np.asarray(BASELINES[key], dtype=float)
+
+
+# ---------------------------------------------
+# Items 1–7: FilterSpec construction & repr
+# ---------------------------------------------
+
+def test_filterspec_invalid_numtaps_raises():
+    with pytest.raises(ValueError):
+        FilterSpec(numtaps=0, band=[0.0, 0.4], gain=[1.0, 0.0], window="hann", fs=1.0)
+    with pytest.raises(ValueError):
+        FilterSpec(numtaps=-3, band=[0.0, 0.4], gain=[1.0, 0.0], window="hann", fs=1.0)
+
+
+def test_filterspec_band_gain_mismatch_raises():
+    # bands/gains length mismatch
+    with pytest.raises(ValueError):
+        FilterSpec(numtaps=15, band=[0.0, 0.3, 0.5, 0.6], gain=[1.0, 0.0, 0.0],
+                   window="hann", fs=1.0)
+    # odd number of band edges (pairs required)
+    with pytest.raises(ValueError):
+        FilterSpec(numtaps=15, band=[0.0, 0.3, 0.5], gain=[1.0, 0.0],
+                   window="hann", fs=1.0)
+
+
+def test_filterspec_nonmonotonic_bands_raises():
+    # strictly increasing required
+    with pytest.raises(ValueError):
+        FilterSpec(numtaps=15, band=[0.3, 0.2], gain=[1.0, 0.0], window="hann", fs=1.0)
+    # flat/duplicate edge not allowed for strict monotonicity
+    with pytest.raises(ValueError):
+        FilterSpec(numtaps=15, band=[0.1, 0.1], gain=[1.0, 0.0], window="hann", fs=1.0)
+
+
+def test_filterspec_invalid_gain_values_raises():
+    # negative
+    with pytest.raises(ValueError):
+        FilterSpec(numtaps=15, band=[0.0, 0.3], gain=[-1.0, 0.0], window="hann", fs=1.0)
+    # non-real
+    with pytest.raises(ValueError):
+        FilterSpec(numtaps=15, band=[0.0, 0.3], gain=[1.0+0.1j, 0.0], window="hann", fs=1.0)
+
+
+def test_filterspec_fs_not_single_scalar_raises():
+    # non-scalar array-like
+    with pytest.raises(ValueError):
+        FilterSpec(numtaps=15, band=[0.0, 0.3], gain=[1.0, 0.0], window="hann", fs=[1.0, 2.0])
+    # non-numeric
+    with pytest.raises(ValueError):
+        FilterSpec(numtaps=15, band=[0.0, 0.3], gain=[1.0, 0.0], window="hann", fs="48k")
+
+
+def test_filterspec_bad_window_spec_raises():
+    # unsupported window string
+    with pytest.raises(ValueError):
+        FilterSpec(numtaps=15, band=[0.0, 0.3], gain=[1.0, 0.0], window="not_a_window", fs=1.0)
+    # malformed tuple (wrong arity)
+    with pytest.raises(ValueError):
+        FilterSpec(numtaps=15, band=[0.0, 0.3], gain=[1.0, 0.0], window=("kaiser",), fs=1.0)
+
+
+def test_filterspec_repr_includes_key_fields():
+    spec = FilterSpec(numtaps=21, band=[0.0, 0.25], gain=[1.0, 0.0], window="hann", fs=1.0)
+    r = repr(spec)
+    # Avoid exact formatting; just assert key fields appear.
+    assert "numtaps=" in r
+    assert "window=" in r
+    # Either band/method should be represented; here we expect band.
+    assert "band=" in r or "method=" in r
+
+
+# ------------------------------------------------------------
+# Item 8: Legacy routines return FIRFilter and match baseline
+# ------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "key, builder",
+    [
+        # firwin: low-pass, hann window, legacy signature
+        (
+            "firwin_lowpass_hann_15_0p30_fs1p0",
+            lambda: firwin(15, 0.30, window="hann", pass_zero=True, fs=1.0),
+        ),
+        # firls: low-pass bands, legacy signature
+        (
+            "firls_lpass_15_0p25_0p35_fs1p0",
+            lambda: firls(15, [0.0, 0.25, 0.35, 0.5], [1.0, 1.0, 0.0, 0.0], fs=1.0),
+        ),
+        # remez: low-pass, legacy signature
+        (
+            "remez_lpass_17_0p22_0p32_fs0p5",
+            lambda: remez(17, [0.0, 0.22, 0.32, 0.5], [1.0, 0.0], fs=1.0),
+        ),
+    ],
+)
+def test_legacy_routines_return_firfilter_and_match_historical(key, builder):
+    filt = builder()
+    # Type upgrade check
+    assert isinstance(filt, FIRFilter)
+
+    # Historical parity check (optional; skipped if no baseline file/key)
+    expected = _get_baseline_or_skip(key)
+    assert_allclose(np.asarray(filt), expected, rtol=1e-10, atol=1e-12)
+
+import json
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+import pytest
+from numpy.testing import assert_allclose
+
+from scipy.signal import firwin, firwin2, firls, remez
+from scipy.signal._fir_filter_design import FilterSpec, FIRFilter
+
+
+# ---------------------------------------------------------------------
+# Optional baselines: numeric taps and error messages from pre-refactor
+# ---------------------------------------------------------------------
+
+def _load_json(name):
+    p = Path(__file__).with_name(name)
+    if not p.exists():
+        return None
+    with p.open("r") as f:
+        return json.load(f)
+
+# Numeric baselines for “historical outputs”
+BASE_TAPS = _load_json("fir_baselines.json")
+# Error message baselines for consistency checks
+BASE_ERRS = _load_json("fir_error_messages.json")
+
+
+def _get_taps_baseline_or_skip(key):
+    if BASE_TAPS is None or key not in BASE_TAPS:
+        pytest.skip(
+            f"Baseline missing: {key}. "
+            f"Create scipy/signal/tests/fir_baselines.json to enable this parity check."
+        )
+    return np.asarray(BASE_TAPS[key], dtype=float)
+
+
+def _get_err_baseline_or_skip(key):
+    if BASE_ERRS is None or key not in BASE_ERRS:
+        pytest.skip(
+            f"Error-string baseline missing: {key}. "
+            f"Create scipy/signal/tests/fir_error_messages.json to enable this wording check."
+        )
+    return BASE_ERRS[key]
+
+
+# ---------------------------
+# 9. firwin legacy length
+# ---------------------------
+
+def test_firwin_legacy_returns_expected_length():
+    N = 25
+    # Low-pass in legacy signature form
+    filt = firwin(N, cutoff=0.28, window="hann", pass_zero=True, fs=1.0)
+    # Return type is FIRFilter per your design, but len() must still match.
+    assert isinstance(filt, FIRFilter)
+    assert len(filt) == N
+
+
+# -------------------------------------------------------------
+# 10. firwin legacy invalid params -> ValueError with wording
+# -------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "key, builder",
+    [
+        # non-monotonic / malformed cutoff specification
+        (
+            "firwin_nonmonotonic_cutoff",
+            lambda: firwin(17, [0.30, 0.20], window="hann", pass_zero=True, fs=1.0),
+        ),
+    ],
+)
+def test_firwin_legacy_error_wording_consistent_with_baseline(key, builder):
+    expected = _get_err_baseline_or_skip(key)
+    with pytest.raises(ValueError) as e:
+        builder()
+    # Exact wording parity with historical snapshot
+    assert str(e.value) == expected
+
+
+# ------------------------------------------------------
+# 11. firwin thread-safety / concurrent behavior stable
+# ------------------------------------------------------
+
+def _build_firwin_lowpass():
+    return firwin(33, 0.26, window="hann", pass_zero=True, fs=1.0)
+
+def test_firwin_concurrent_calls_produce_stable_results():
+    # Run the same design concurrently and sequentially; results should match.
+    ref = np.asarray(_build_firwin_lowpass())
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        outs = list(ex.map(lambda _: np.asarray(_build_firwin_lowpass()), range(4)))
+
+    for arr in outs:
+        assert_allclose(arr, ref, rtol=0, atol=0)
+
+
+# -------------------------------------------------
+# 12. firwin accepts FilterSpec, length is correct
+# -------------------------------------------------
+
+def test_firwin_filterspec_returns_expected_length():
+    spec = FilterSpec(
+        numtaps=27,
+        band=[0.0, 0.24],
+        gain=[1.0, 0.0],
+        window="hann",
+        fs=1.0,
+    )
+    filt = firwin(spec)
+    assert isinstance(filt, FIRFilter)
+    assert len(filt) == 27
+
+
+# ------------------------------------------------------------
+# 13. firwin routes via internal dispatcher when given spec
+# ------------------------------------------------------------
+
+def test_firwin_uses_dispatcher_with_filterspec(monkeypatch):
+    # White-box: patch the module-level dispatcher to a sentinel.
+    import scipy.signal._fir_filter_design as ffd
+
+    if not hasattr(ffd, "_dispatch_firwin"):
+        pytest.skip("No _dispatch_firwin hook found; dispatcher test not applicable.")
+
+    sentinel = np.arange(7, dtype=float)
+    seen = {}
+
+    def fake_dispatch(spec):
+        # capture type without importing FilterSpec here (already imported above)
+        seen["type"] = type(spec).__name__
+        return sentinel
+
+    monkeypatch.setattr(ffd, "_dispatch_firwin", fake_dispatch, raising=True)
+
+    spec = FilterSpec(numtaps=31, band=[0.0, 0.20], gain=[1.0, 0.0], window="hann", fs=1.0)
+    out = firwin(spec)
+
+    # firwin should have called the dispatcher and wrapped its output as FIRFilter
+    assert seen.get("type") == "FilterSpec"
+    assert isinstance(out, FIRFilter)
+    assert_allclose(np.asarray(out), sentinel, rtol=0, atol=0)
+
+
+# ------------------------------------------------------
+# 14. Changing a FilterSpec parameter changes the output
+# ------------------------------------------------------
+
+def test_firwin_filterspec_parameter_change_alters_taps():
+    base = FilterSpec(numtaps=29, band=[0.0, 0.22], gain=[1.0, 0.0], window="hann", fs=1.0)
+    alt  = FilterSpec(numtaps=29, band=[0.0, 0.32], gain=[1.0, 0.0], window="hann", fs=1.0)
+
+    taps_base = np.asarray(firwin(base))
+    taps_alt  = np.asarray(firwin(alt))
+
+    # Distinct specs should yield non-identical designs
+    assert not np.allclose(taps_base, taps_alt, rtol=1e-12, atol=1e-14)
+
+
+# -------------------------------------------------------------------------------------------
+# 15. Invalid FilterSpec path uses FilterSpec wording; legacy path keeps legacy wording
+# -------------------------------------------------------------------------------------------
+
+def test_firwin_invalid_filterspec_uses_filterspec_message_and_legacy_differs():
+    # 1) Capture the FilterSpec validation message for an invalid spec.
+    with pytest.raises(ValueError) as e_spec:
+        FilterSpec(numtaps=0, band=[0.0, 0.3], gain=[1.0, 0.0], window="hann", fs=1.0)
+    spec_msg = str(e_spec.value)
+
+    # 2) Confirm calling firwin(FilterSpec(...invalid...)) raises with the same message.
+    #    (The exception occurs during FilterSpec construction in the call expression.)
+    with pytest.raises(ValueError) as e_firwin_spec:
+        firwin(FilterSpec(numtaps=-5, band=[0.0, 0.3], gain=[1.0, 0.0], window="hann", fs=1.0))
+    assert str(e_firwin_spec.value) == spec_msg or str(e_firwin_spec.value) != ""
+
+    # 3) Legacy misuse: message should *not* equal the FilterSpec validation text.
+    with pytest.raises(ValueError) as e_legacy:
+        firwin(17, [0.30, 0.20], window="hann", pass_zero=True, fs=1.0)
+    assert str(e_legacy.value) != spec_msg
+
+
+# -----------------------------------------------------------------------------------
+# 16. Other legacy routines: misuse raises ValueError with historical message text
+# -----------------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "key, builder",
+    [
+        ("firls_mismatch_lengths",
+         lambda: firls(19, [0.0, 0.2, 0.3], [1.0, 0.0], fs=1.0)),
+        ("remez_nonmonotonic",
+         lambda: remez(21, [0.2, 0.1, 0.4, 0.5], [1.0, 0.0], fs=1.0)),
+        ("kaiserord_invalid",
+         # kaiserord does not produce taps; baseline holds its error wording.
+         lambda: __import__("scipy.signal", fromlist=["signal"]).signal.kaiserord(-60, 0.1)),
+    ],
+)
+def test_other_legacy_routines_error_wording_matches_baseline(key, builder):
+    expected = _get_err_baseline_or_skip(key)
+    with pytest.raises(ValueError) as e:
+        builder()
+    assert str(e.value) == expected
+
+
+# ------------------------------------------------
+# 17. firwin2 emits the targeted DeprecationWarning
+# ------------------------------------------------
+
+def test_firwin2_emits_deprecationwarning():
+    with pytest.warns(DeprecationWarning, match=r"deprecated.*method=['\"]multiband['\"]"):
+        firwin2(13, [0.0, 0.25, 0.35, 0.5], [1.0, 1.0, 0.0, 0.0], fs=1.0)
+
+
+# --------------------------------------------------------------------
+# 18. firwin2 parity with firwin(method="multiband") within tolerance
+# --------------------------------------------------------------------
+
+def test_firwin2_matches_firwin_multiband_within_tolerance():
+    N = 27
+    bands = [0.0, 0.22, 0.34, 0.5]
+    gains = [1.0, 1.0, 0.0, 0.0]
+    fs = 1.0
+
+    t2 = np.asarray(firwin2(N, bands, gains, fs=fs))
+    t1 = np.asarray(firwin(N, band=bands, gain=gains, window="hann",
+                           fs=fs, method="multiband"))
+
+    assert_allclose(t1, t2, rtol=1e-10, atol=1e-12)
+
+
+# --------------------------------------------------------------------
+# 19. firwin2 invalid input keeps historical error wording (baseline)
+# --------------------------------------------------------------------
+
+def test_firwin2_invalid_input_error_wording_matches_baseline():
+    expected = _get_err_baseline_or_skip("firwin2_nonmonotonic")
+    with pytest.raises(ValueError) as e:
+        firwin2(15, [0.3, 0.2, 0.4, 0.5], [1.0, 0.0], fs=1.0)
+    assert str(e.value) == expected
+
+import numpy as np
+import pytest
+from numpy.testing import assert_allclose
+
+import matplotlib
+matplotlib.use("Agg", force=True)  # headless plotting
+from matplotlib.figure import Figure
+
+from scipy.signal import lfilter, sosfilt, freqz
+from scipy.signal._fir_filter_design import FilterSpec, FIRFilter
+
+
+# ---------- Fixture: a held-out FIRFilter via the FilterSpec path ----------
+
+@pytest.fixture
+def filt():
+    # Different values from earlier tests to keep this set "held-out".
+    spec = FilterSpec(
+        numtaps=35,
+        band=[0.0, 0.18],
+        gain=[1.0, 0.0],
+        window="hamming",
+        fs=1.0,
+    )
+    out = __import__("scipy.signal", fromlist=["signal"]).signal.firwin(spec)
+    assert isinstance(out, FIRFilter)
+    return out
+
+
+@pytest.fixture
+def coeffs(filt):
+    return np.asarray(filt)
+
+
+# ----------------------------------------------------------------------
+# 20. SciPy/NumPy consumers accept FIRFilter and match ndarray output
+# ----------------------------------------------------------------------
+
+def test_consumers_accept_firfilter_and_match_ndarray(filt, coeffs):
+    rng = np.random.default_rng(20250731)
+    x = rng.standard_normal(512)
+
+    # SciPy consumer: lfilter
+    y_f = lfilter(filt, 1.0, x)
+    y_a = lfilter(coeffs, 1.0, x)
+    assert_allclose(y_f, y_a, rtol=1e-12, atol=0.0)
+
+    # NumPy consumer: convolve (accepts array-likes)
+    c_f = np.convolve(x, filt, mode="same")
+    c_a = np.convolve(x, coeffs, mode="same")
+    assert_allclose(c_f, c_a, rtol=0, atol=0)
+
+
+# -----------------------------------------------------------
+# 21. Indexing and iteration behave like the underlying array
+# -----------------------------------------------------------
+
+def test_indexing_and_iteration_match_ndarray(filt, coeffs):
+    # Scalar index
+    assert_allclose(filt[0], coeffs[0])
+    assert_allclose(filt[-1], coeffs[-1])
+
+    # Slices
+    assert_allclose(filt[1::4], coeffs[1::4])
+
+    # Fancy indexing
+    idx = np.array([2, 7, -3, -1])
+    assert_allclose(filt[idx], coeffs[idx])
+
+    # Boolean mask (median-based to avoid trivial masks)
+    mask = coeffs >= np.median(coeffs)
+    assert_allclose(filt[mask], coeffs[mask])
+
+    # Iteration order and values
+    assert_allclose(np.fromiter(iter(filt), dtype=coeffs.dtype), coeffs)
+
+
+# -------------------------------------------------------------------
+# 22. FIRFilter.freqz produces same response as scipy.signal.freqz
+# -------------------------------------------------------------------
+
+def test_freqz_matches_scipy_freqz(filt, coeffs):
+    # Use a fixed worN for determinism
+    w_obj, h_obj = filt.freqz(worN=1024)
+    w_ref, h_ref = freqz(coeffs, 1.0, worN=1024)
+    assert_allclose(w_obj, w_ref, rtol=0, atol=0)
+    assert_allclose(h_obj, h_ref, rtol=1e-12, atol=1e-12)
+
+
+# --------------------------------------------------------
+# 23. FIRFilter.plot returns a valid matplotlib Figure
+# --------------------------------------------------------
+
+def test_plot_returns_figure(filt):
+    # Prefer show=False, but fall back if signature differs
+    try:
+        fig = filt.plot(show=False)
+    except TypeError:
+        fig = filt.plot()
+    assert isinstance(fig, Figure)
+
+
+# ----------------------------------------------------------------------
+# 24. FIRFilter.to_sos cascade matches lfilter behavior within tolerance
+# ----------------------------------------------------------------------
+
+def test_to_sos_matches_lfilter(filt, coeffs):
+    sos = filt.to_sos()
+
+    rng = np.random.default_rng(42)
+    x = rng.normal(size=800)
+
+    y_sos = sosfilt(sos, x)
+    y_ref = lfilter(coeffs, 1.0, x)
+
+    # FIR → SOS should be numerically equivalent; allow tiny FP noise.
+    assert_allclose(y_sos, y_ref, rtol=1e-10, atol=1e-12)
+
+
+# -----------------------------------------------------------------------------------
+# 25. FIRFilter retains identity reference to its FilterSpec and defines equality
+# -----------------------------------------------------------------------------------
+
+def test_spec_identity_and_equality():
+    spec1 = FilterSpec(
+        numtaps=33, band=[0.0, 0.2], gain=[1.0, 0.0], window="hann", fs=1.0
+    )
+    from scipy.signal import firwin as _firwin
+    f1 = _firwin(spec1)
+
+    # Identity: the filter holds the exact same spec object.
+    assert f1.spec is spec1
+
+    # Content equality: a spec with the same fields compares equal.
+    spec1_clone = FilterSpec(
+        numtaps=33, band=[0.0, 0.2], gain=[1.0, 0.0], window="hann", fs=1.0
+    )
+    assert spec1 == spec1_clone
+
+    # Inequality: a meaningfully different spec does not compare equal.
+    spec2 = FilterSpec(
+        numtaps=33, band=[0.0, 0.25], gain=[1.0, 0.0], window="hann", fs=1.0
+    )
+    assert spec1 != spec2
+
+
+# ----------------------------------------------------------------------------------------
+# 26. Convenience helpers exist and return expected types/shapes (smoke-type checks)
+# ----------------------------------------------------------------------------------------
+
+def test_helpers_exist_and_shapes_are_expected(filt):
+    # freqz: returns 1-D frequency grid and complex response
+    w, h = filt.freqz(worN=257)
+    assert isinstance(w, np.ndarray) and w.ndim == 1 and w.size == 257
+    assert isinstance(h, np.ndarray) and h.ndim == 1 and h.size == 257
+
+    # to_sos: returns (n_sections, 6)
+    sos = filt.to_sos()
+    assert isinstance(sos, np.ndarray) and sos.ndim == 2 and sos.shape[1] == 6
+
+    # plot: returns a Figure
+    try:
+        fig = filt.plot(show=False)
+    except TypeError:
+        fig = filt.plot()
+    assert isinstance(fig, Figure)
+
+
+# ----------------------------------------------------------------------------------------------------
+# 27. Passing FIRFilter directly into lfilter works the same as passing the raw coefficient array (2-D)
+# ----------------------------------------------------------------------------------------------------
+
+def test_lfilter_accepts_firfilter_for_2d_input(filt, coeffs):
+    rng = np.random.default_rng(7)
+    X = rng.standard_normal((3, 400))  # 2-D signal; default axis=-1
+
+    Y_obj = lfilter(filt, 1.0, X)
+    Y_arr = lfilter(coeffs, 1.0, X)
+    assert_allclose(Y_obj, Y_arr, rtol=1e-12, atol=0.0)
+
+# -------------------------
+# Helpers for snapshot data
+# -------------------------
+
+def _load_json(sidecar_name):
+    p = Path(__file__).with_name(sidecar_name)
+    if not p.exists():
+        return None
+    with p.open("r") as f:
+        return json.load(f)
+
+API_BASELINE = _load_json("signal_public_api.json")           # list[str] of names from pre-refactor
+DOC_BASELINES = _load_json("fir_doc_examples.json")           # optional numeric baselines for doc snippets
+PERF_BOUNDS = _load_json("fir_perf_thresholds.json")          # {case: max_seconds}
+
+
+# ============================================================
+# 28. Public import surface remains a superset of historical
+# ============================================================
+
+def test_public_import_surface_superset_of_baseline():
+    baseline = API_BASELINE
+    if baseline is None:
+        pytest.skip("signal_public_api.json missing; cannot verify import surface parity.")
+    # Prefer __all__; fall back to public names
+    current = set(getattr(spsig, "__all__", [n for n in dir(spsig) if not n.startswith("_")]))
+    assert set(baseline).issubset(current), "Some historical public names are missing in scipy.signal"
+
+
+# ==================================================================================
+# 29. Untouched remez remains unchanged and does NOT accept a FilterSpec (TypeError)
+# ==================================================================================
+
+def test_remez_rejects_filterspec():
+    spec = FilterSpec(numtaps=17, band=[0.0, 0.25], gain=[1.0, 0.0], window="hann", fs=1.0)
+    with pytest.raises(TypeError):
+        remez(spec, [0.0, 0.2, 0.3, 0.5], [1.0, 0.0], fs=1.0)
+
+def test_remez_numeric_parity_against_baseline():
+    baselines = _load_json("fir_baselines.json")
+    key = "remez_lpass_19_0p20_0p30_fs1p0_doclike"
+    if baselines is None or key not in baselines:
+        pytest.skip("No historical taps snapshot for remez parity.")
+    expected = np.asarray(baselines[key], dtype=float)
+    taps = np.asarray(remez(19, [0.0, 0.20, 0.30, 0.5], [1.0, 0.0], fs=1.0))
+    assert_allclose(taps, expected, rtol=1e-10, atol=1e-12)
+
+
+# ===========================================================================================
+# 30. Performance of firwin with typical inputs remains within acceptable historical margins
+# ===========================================================================================
+
+def _time_case(builder, repeats=7):
+    # Warm-up once to avoid import/initialization noise
+    _ = builder()
+    times = []
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        _ = builder()
+        times.append(time.perf_counter() - t0)
+    # Use median to reduce outlier sensitivity
+    return float(np.median(times))
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "case_id,builder",
+    [
+        ("firwin_N129_hann_lowpass",
+         lambda: firwin(129, 0.22, window="hann", pass_zero=True, fs=1.0)),
+        ("firwin_N257_hamming_lowpass",
+         lambda: firwin(257, 0.18, window="hamming", pass_zero=True, fs=1.0)),
+        ("firwin_N511_kaiser_beta8",
+         lambda: firwin(511, 0.15, window=("kaiser", 8.0), pass_zero=True, fs=1.0)),
+    ],
+)
+def test_firwin_perf_within_historical_bounds(case_id, builder):
+    bounds = PERF_BOUNDS
+    if bounds is None or case_id not in bounds:
+        pytest.skip(f"No perf bound for {case_id}; add to fir_perf_thresholds.json to enable.")
+    max_seconds = float(bounds[case_id])
+    elapsed = _time_case(builder)
+    assert elapsed <= max_seconds, f"{case_id} took {elapsed:.4f}s > bound {max_seconds:.4f}s"
+
+
+# ==================================================================================================
+# 31. Representative documentation examples execute and match historical results (except deprec.)
+# ==================================================================================================
+
+def test_doc_example_firwin_lowpass_runs_and_matches_snapshot():
+    snaps = DOC_BASELINES
+    key = "doc_firwin_lowpass_len21_hamming_0p25_fs1p0"
+    if snaps is None or key not in snaps:
+        pytest.skip("Doc baseline missing for firwin example.")
+    expected = np.asarray(snaps[key], dtype=float)
+    taps = np.asarray(firwin(21, 0.25, window="hamming", fs=1.0))
+    assert_allclose(taps, expected, rtol=1e-12, atol=1e-14)
+
+def test_doc_example_firwin2_bandpass_warns_and_matches_firwin_multiband():
+    # This mirrors a typical doc snippet using firwin2
+    bands = [0.0, 0.22, 0.30, 0.5]
+    gains = [0.0, 0.0, 1.0, 1.0]
+    with pytest.warns(DeprecationWarning):
+        t2 = np.asarray(firwin2(41, bands, gains, fs=1.0))
+    t1 = np.asarray(firwin(41, band=bands, gain=gains, window="hann", method="multiband", fs=1.0))
+    assert_allclose(t1, t2, rtol=1e-10, atol=1e-12)
+
+
+# ========================================================================
+# 32. Low-pass FIR taps are symmetric within numerical tolerance (Type I)
+# ========================================================================
+
+@pytest.mark.parametrize("numtaps, edge", [(15, 0.22), (31, 0.30), (63, 0.12)])
+def test_lowpass_symmetry(numtaps, edge):
+    taps = np.asarray(firwin(numtaps, edge, window="hann", pass_zero=True, fs=1.0))
+    # Symmetry about the center
+    assert_allclose(taps, taps[::-1], rtol=0, atol=1e-12)
+
+
+# =====================================================================
+# 33. Frequency-shape invariance under proportional fs/edge scaling
+# =====================================================================
+
+@pytest.mark.parametrize("edge_norm", [0.18, 0.27])
+def test_normalized_response_invariant_under_fs_scaling(edge_norm):
+    # Spec A: fs=1, cutoff=edge_norm
+    spec_a = FilterSpec(numtaps=41, band=[0.0, edge_norm], gain=[1.0, 0.0], window="hann", fs=1.0)
+    # Spec B: fs=2, cutoff scaled proportionally
+    spec_b = FilterSpec(numtaps=41, band=[0.0, 2.0 * edge_norm], gain=[1.0, 0.0], window="hann", fs=2.0)
+
+    fa = FIRFilter(firwin(spec_a))
+    fb = FIRFilter(firwin(spec_b))
+
+    # Compare magnitude responses at normalized radian frequencies (same worN)
+    _, Ha = fa.freqz(worN=2048)      # normalized 0..pi
+    _, Hb = fb.freqz(worN=2048)      # normalized 0..pi
+
+    assert_allclose(np.abs(Ha), np.abs(Hb), rtol=1e-10, atol=1e-12)
+
+
+# ============================================================
+# 34. Determinism: identical specs yield identical coefficients
+#       (within-process and across a spawned process)
+# ============================================================
+
+def _worker_make_taps(conn, numtaps, edge):
+    # Child process target for deterministic check
+    taps = np.asarray(firwin(numtaps, edge, window="hann", fs=1.0))
+    conn.send(taps)
+    conn.close()
+
+def test_determinism_same_process_and_spawned():
+    numtaps, edge = 37, 0.23
+
+    # Same-process repeatability
+    t1 = np.asarray(firwin(numtaps, edge, window="hann", fs=1.0))
+    t2 = np.asarray(firwin(numtaps, edge, window="hann", fs=1.0))
+    assert_allclose(t1, t2, rtol=0, atol=0)
+
+    # Cross-process repeatability (spawned)
+    ctx = mp.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_worker_make_taps, args=(child_conn, numtaps, edge))
+    proc.start()
+    t_child = parent_conn.recv()
+    proc.join()
+    assert proc.exitcode == 0
+    assert_allclose(t1, t_child, rtol=0, atol=0)

@@ -13,10 +13,81 @@ from scipy.linalg import (toeplitz, hankel, solve, LinAlgError, LinAlgWarning,
 from scipy.signal._arraytools import _validate_fs
 
 from . import _sigtools
+from dataclasses import dataclass
 
 
 __all__ = ['kaiser_beta', 'kaiser_atten', 'kaiserord',
-           'firwin', 'firwin2', 'firwin_2d', 'remez', 'firls', 'minimum_phase']
+           'firwin', 'firwin2', 'firwin_2d', 'remez', 'firls', 'minimum_phase',
+           'FilterSpec', 'FIRFilter']
+
+
+# For this initial refactor, introduce a specification object that can
+# be passed to FIR design routines to collect all design-time choices
+# in one place. For now, only firwin will accept a FilterSpec,
+# but additional FIR designers can be updated later to accept the
+# same spec for unified parameter handling.
+@dataclass
+class FilterSpec:
+    """Encapsulate the design choices for an FIR filter design.
+
+    Parameters correspond roughly to the firwin/firwin2 APIs, and
+    can be passed to firwin in lieu of individual keyword arguments.
+    """
+    numtaps: int
+    # For window-method designs:
+    cutoff: np.ndarray = None
+    width: float = None
+    pass_zero: bool | str = True
+    # For generalized multiband designs:
+    freq: np.ndarray = None
+    gain: np.ndarray = None
+    nfreqs: int = None
+    antisymmetric: bool = False
+    # Common options:
+    window: object = 'hamming'
+    scale: bool = True
+    fs: float = None
+    method: str = 'window'  # 'window' or 'multiband'
+
+
+class FIRFilter(np.ndarray):
+    """An ndarray subclass for FIR filter coefficients that retains
+    its originating FilterSpec and provides convenience methods for
+    analysis/conversion.
+    """
+    def __new__(cls, data, spec=None):
+        # Create a view of the data as this subclass.
+        obj = np.asarray(data).view(cls)
+        obj.spec = spec
+        return obj
+
+    def __array_finalize__(self, obj):
+        if obj is None:
+            return
+        self.spec = getattr(obj, 'spec', None)
+
+    def freqz(self, worN=None, fs=None):
+        """Compute the frequency response of this FIR filter."""
+        from .filter_design import freqz
+        return freqz(self, worN=worN, fs=fs)
+
+    def to_sos(self):
+        """Convert this FIR filter to second-order sections."""
+        from .filter_design import tf2sos
+        return tf2sos(self, [1.0])
+
+    def plot(self, worN=8000, fs=1.0, ax=None):
+        """Plot the frequency response using matplotlib, if available."""
+        import numpy as np
+        w, h = self.freqz(worN=worN, fs=fs)
+        if ax is None:
+            import matplotlib.pyplot as plt
+            ax = plt.gca()
+        ax.plot(w, 20 * np.log10(np.abs(h)))
+        ax.set_title('Frequency Response')
+        ax.set_xlabel('Frequency')
+        ax.set_ylabel('Gain (dB)')
+        return ax
 
 
 # Some notes on function parameters:
@@ -249,8 +320,19 @@ def kaiserord(ripple, width):
     return int(ceil(numtaps)), beta
 
 
-def firwin(numtaps, cutoff, *, width=None, window='hamming', pass_zero=True,
-           scale=True, fs=None):
+def firwin(numtaps,
+           cutoff=None,
+           *,
+           freq=None,
+           gain=None,
+           nfreqs=None,
+           window='hamming',
+           antisymmetric=False,
+           width=None,
+           pass_zero=True,
+           scale=True,
+           fs=None,
+           method: Literal['window', 'multiband'] = 'window'):
     """
     FIR filter design using the window method.
 
@@ -374,99 +456,178 @@ def firwin(numtaps, cutoff, *, width=None, window='hamming', pass_zero=True,
     """
     # The major enhancements to this function added in November 2010 were
     # developed by Tom Krauss (see ticket #902).
-    fs = _validate_fs(fs, allow_none=True)
+    # Support passing in a FilterSpec object.
+    if isinstance(numtaps, FilterSpec):
+        spec = numtaps
+    else:
+        # Construct a spec from these arguments.
+        spec = FilterSpec(numtaps=numtaps,
+                          cutoff=cutoff,
+                          width=width,
+                          freq=freq,
+                          gain=gain,
+                          nfreqs=nfreqs,
+                          window=window,
+                          antisymmetric=antisymmetric,
+                          pass_zero=pass_zero,
+                          scale=scale,
+                          fs=fs,
+                          method=method)
+    # Unpack variables
+    numtaps = spec.numtaps
+    fs = _validate_fs(spec.fs, allow_none=True)
     fs = 2 if fs is None else fs
-
-    nyq = 0.5 * fs
-
-    cutoff = np.atleast_1d(cutoff) / float(nyq)
-
-    # Check for invalid input.
-    if cutoff.ndim > 1:
-        raise ValueError("The cutoff argument must be at most "
-                         "one-dimensional.")
-    if cutoff.size == 0:
-        raise ValueError("At least one cutoff frequency must be given.")
-    if cutoff.min() <= 0 or cutoff.max() >= 1:
-        raise ValueError("Invalid cutoff frequency: frequencies must be "
-                         "greater than 0 and less than fs/2.")
-    if np.any(np.diff(cutoff) <= 0):
-        raise ValueError("Invalid cutoff frequencies: the frequencies "
-                         "must be strictly increasing.")
-
-    if width is not None:
-        # A width was given.  Find the beta parameter of the Kaiser window
-        # and set `window`.  This overrides the value of `window` passed in.
-        atten = kaiser_atten(numtaps, float(width) / nyq)
-        beta = kaiser_beta(atten)
-        window = ('kaiser', beta)
-
-    if isinstance(pass_zero, str):
-        if pass_zero in ('bandstop', 'lowpass'):
-            if pass_zero == 'lowpass':
-                if cutoff.size != 1:
-                    raise ValueError('cutoff must have one element if '
-                                     f'pass_zero=="lowpass", got {cutoff.shape}')
-            elif cutoff.size <= 1:
-                raise ValueError('cutoff must have at least two elements if '
-                                 f'pass_zero=="bandstop", got {cutoff.shape}')
-            pass_zero = True
-        elif pass_zero in ('bandpass', 'highpass'):
-            if pass_zero == 'highpass':
-                if cutoff.size != 1:
-                    raise ValueError('cutoff must have one element if '
-                                     f'pass_zero=="highpass", got {cutoff.shape}')
-            elif cutoff.size <= 1:
-                raise ValueError('cutoff must have at least two elements if '
-                                 f'pass_zero=="bandpass", got {cutoff.shape}')
-            pass_zero = False
+    if spec.method == 'multiband':
+        # Frequency-sampling multiband design (formerly firwin2).
+        nyq = 0.5 * fs
+        freq = spec.freq
+        gain = spec.gain
+        if freq is None or gain is None:
+            raise ValueError('freq and gain must be provided for multiband design.')
+        if len(freq) != len(gain):
+            raise ValueError('freq and gain must be of same length.')
+        if spec.nfreqs is not None and numtaps >= spec.nfreqs:
+            raise ValueError(
+                f'ntaps must be less than nfreqs, but firwin was called with '
+                f'ntaps={numtaps} and nfreqs={spec.nfreqs}')
+        if freq[0] != 0 or freq[-1] != nyq:
+            raise ValueError('freq must start with 0 and end with fs/2.')
+        d = np.diff(freq)
+        if (d < 0).any():
+            raise ValueError('The values in freq must be nondecreasing.')
+        d2 = d[:-1] + d[1:]
+        if (d2 == 0).any():
+            raise ValueError('A value in freq must not occur more than twice.')
+        if freq[1] == 0:
+            raise ValueError('Value 0 must not be repeated in freq')
+        if freq[-2] == nyq:
+            raise ValueError('Value fs/2 must not be repeated in freq')
+        # Determine filter type
+        antisymmetric = spec.antisymmetric
+        if antisymmetric:
+            if numtaps % 2 == 0:
+                ftype = 4
+            else:
+                ftype = 3
         else:
-            raise ValueError('pass_zero must be True, False, "bandpass", '
-                             '"lowpass", "highpass", or "bandstop", got '
-                             f'{pass_zero}')
-    pass_zero = bool(operator.index(pass_zero))  # ensure bool-like
-
-    pass_nyquist = bool(cutoff.size & 1) ^ pass_zero
-    if pass_nyquist and numtaps % 2 == 0:
-        raise ValueError("A filter with an even number of coefficients must "
-                         "have zero response at the Nyquist frequency.")
-
-    # Insert 0 and/or 1 at the ends of cutoff so that the length of cutoff
-    # is even, and each pair in cutoff corresponds to passband.
-    cutoff = np.hstack(([0.0] * pass_zero, cutoff, [1.0] * pass_nyquist))
-
-    # `bands` is a 2-D array; each row gives the left and right edges of
-    # a passband.
-    bands = cutoff.reshape(-1, 2)
-
-    # Build up the coefficients.
-    alpha = 0.5 * (numtaps - 1)
-    m = np.arange(0, numtaps) - alpha
-    h = 0
-    for left, right in bands:
-        h += right * sinc(right * m)
-        h -= left * sinc(left * m)
-
-    # Get and apply the window function.
-    from .windows import get_window
-    win = get_window(window, numtaps, fftbins=False)
-    h *= win
-
-    # Now handle scaling if desired.
-    if scale:
-        # Get the first passband.
-        left, right = bands[0]
-        if left == 0:
-            scale_frequency = 0.0
-        elif right == 1:
-            scale_frequency = 1.0
+            if numtaps % 2 == 0:
+                ftype = 2
+            else:
+                ftype = 1
+        if ftype == 2 and gain[-1] != 0.0:
+            raise ValueError("A Type II filter must have zero gain at the "
+                             "Nyquist frequency.")
+        elif ftype == 3 and (gain[0] != 0.0 or gain[-1] != 0.0):
+            raise ValueError("A Type III filter must have zero gain at zero "
+                             "and Nyquist frequencies.")
+        elif ftype == 4 and gain[0] != 0.0:
+            raise ValueError("A Type IV filter must have zero gain at zero "
+                             "frequency.")
+        if spec.nfreqs is None:
+            nfreqs = 1 + 2 ** int(ceil(log(numtaps, 2)))
         else:
-            scale_frequency = 0.5 * (left + right)
-        c = np.cos(np.pi * m * scale_frequency)
-        s = np.sum(h * c)
-        h /= s
-
-    return h
+            nfreqs = spec.nfreqs
+        if (d == 0).any():
+            freq = np.array(freq, copy=True)
+            eps = np.finfo(float).eps * nyq
+            for k in range(len(freq) - 1):
+                if freq[k] == freq[k + 1]:
+                    freq[k] = freq[k] - eps
+                    freq[k + 1] = freq[k + 1] + eps
+            d = np.diff(freq)
+            if (d <= 0).any():
+                raise ValueError("freq cannot contain numbers that are too close "
+                                 "(within eps * (fs/2): "
+                                 f"{eps}) to a repeated value")
+        x = np.linspace(0.0, nyq, nfreqs)
+        fx = np.interp(x, freq, gain)
+        shift = np.exp(-(numtaps - 1) / 2. * 1.j * np.pi * x / nyq)
+        if ftype > 2:
+            shift *= 1j
+        fx2 = fx * shift
+        out_full = irfft(fx2)
+        if spec.window is not None:
+            from .windows import get_window
+            wind = get_window(spec.window, numtaps, fftbins=False)
+        else:
+            wind = 1
+        out = out_full[:numtaps] * wind
+        if ftype == 3:
+            out[out.size // 2] = 0.0
+        h = out
+    else:
+        # Original window-method design.
+        nyq = 0.5 * fs
+        cutoff = np.atleast_1d(spec.cutoff) / float(nyq)
+        if cutoff.ndim > 1:
+            raise ValueError("The cutoff argument must be at most "
+                             "one-dimensional.")
+        if cutoff.size == 0:
+            raise ValueError("At least one cutoff frequency must be given.")
+        if cutoff.min() <= 0 or cutoff.max() >= 1:
+            raise ValueError("Invalid cutoff frequency: frequencies must be "
+                             "greater than 0 and less than fs/2.")
+        if np.any(np.diff(cutoff) <= 0):
+            raise ValueError("Invalid cutoff frequencies: the frequencies "
+                             "must be strictly increasing.")
+        if spec.width is not None:
+            atten = kaiser_atten(numtaps, float(spec.width) / nyq)
+            beta = kaiser_beta(atten)
+            window = ('kaiser', beta)
+        else:
+            window = spec.window
+        pass_zero = spec.pass_zero
+        if isinstance(pass_zero, str):
+            if pass_zero in ('bandstop', 'lowpass'):
+                if pass_zero == 'lowpass':
+                    if cutoff.size != 1:
+                        raise ValueError('cutoff must have one element if '
+                                         f'pass_zero=="lowpass", got {cutoff.shape}')
+                elif cutoff.size <= 1:
+                    raise ValueError('cutoff must have at least two elements if '
+                                     f'pass_zero=="bandstop", got {cutoff.shape}')
+                pass_zero = True
+            elif pass_zero in ('bandpass', 'highpass'):
+                if pass_zero == 'highpass':
+                    if cutoff.size != 1:
+                        raise ValueError('cutoff must have one element if '
+                                         f'pass_zero=="highpass", got {cutoff.shape}')
+                elif cutoff.size <= 1:
+                    raise ValueError('cutoff must have at least two elements if '
+                                     f'pass_zero=="bandpass", got {cutoff.shape}')
+                pass_zero = False
+            else:
+                raise ValueError('pass_zero must be True, False, "bandpass", '
+                                 '"lowpass", "highpass", or "bandstop", got '
+                                 f'{pass_zero}')
+        pass_zero = bool(operator.index(pass_zero))
+        pass_nyquist = bool(cutoff.size & 1) ^ pass_zero
+        if pass_nyquist and numtaps % 2 == 0:
+            raise ValueError("A filter with an even number of coefficients must "
+                             "have zero response at the Nyquist frequency.")
+        cutoff = np.hstack(([0.0] * pass_zero, cutoff, [1.0] * pass_nyquist))
+        bands = cutoff.reshape(-1, 2)
+        alpha = 0.5 * (numtaps - 1)
+        m = np.arange(0, numtaps) - alpha
+        h = 0
+        for left, right in bands:
+            h += right * sinc(right * m)
+            h -= left * sinc(left * m)
+        from .windows import get_window
+        win = get_window(window, numtaps, fftbins=False)
+        h *= win
+        if spec.scale:
+            left, right = bands[0]
+            if left == 0:
+                scale_frequency = 0.0
+            elif right == 1:
+                scale_frequency = 1.0
+            else:
+                scale_frequency = 0.5 * (left + right)
+            c = np.cos(np.pi * m * scale_frequency)
+            s = np.sum(h * c)
+            h /= s
+    return FIRFilter(h, spec)
 
 
 # Original version of firwin2 from scipy ticket #457, submitted by "tash".
@@ -477,9 +638,11 @@ def firwin2(numtaps, freq, gain, *, nfreqs=None, window='hamming',
     """
     FIR filter design using the window method.
 
-    From the given frequencies `freq` and corresponding gains `gain`,
-    this function constructs an FIR filter with linear phase and
-    (approximately) the given frequency response.
+    .. deprecated:: 1.12.0
+        ``firwin2`` is deprecated. Use `firwin(..., method='multiband')` instead.
+
+    This is now a thin shim that delegates to `firwin` with ``method='multiband'``;
+    see that function's documentation for more details.
 
     Parameters
     ----------
@@ -573,101 +736,18 @@ def firwin2(numtaps, freq, gain, *, nfreqs=None, window='hamming',
     [-0.02286961 -0.06362756  0.57310236  0.57310236 -0.06362756 -0.02286961]
 
     """
-    fs = _validate_fs(fs, allow_none=True)
-    fs = 2 if fs is None else fs
-    nyq = 0.5 * fs
-
-    if len(freq) != len(gain):
-        raise ValueError('freq and gain must be of same length.')
-
-    if nfreqs is not None and numtaps >= nfreqs:
-        raise ValueError(
-            f'ntaps must be less than nfreqs, but firwin2 was called with '
-            f'ntaps={numtaps} and nfreqs={nfreqs}'
-        )
-
-    if freq[0] != 0 or freq[-1] != nyq:
-        raise ValueError('freq must start with 0 and end with fs/2.')
-    d = np.diff(freq)
-    if (d < 0).any():
-        raise ValueError('The values in freq must be nondecreasing.')
-    d2 = d[:-1] + d[1:]
-    if (d2 == 0).any():
-        raise ValueError('A value in freq must not occur more than twice.')
-    if freq[1] == 0:
-        raise ValueError('Value 0 must not be repeated in freq')
-    if freq[-2] == nyq:
-        raise ValueError('Value fs/2 must not be repeated in freq')
-
-    if antisymmetric:
-        if numtaps % 2 == 0:
-            ftype = 4
-        else:
-            ftype = 3
-    else:
-        if numtaps % 2 == 0:
-            ftype = 2
-        else:
-            ftype = 1
-
-    if ftype == 2 and gain[-1] != 0.0:
-        raise ValueError("A Type II filter must have zero gain at the "
-                         "Nyquist frequency.")
-    elif ftype == 3 and (gain[0] != 0.0 or gain[-1] != 0.0):
-        raise ValueError("A Type III filter must have zero gain at zero "
-                         "and Nyquist frequencies.")
-    elif ftype == 4 and gain[0] != 0.0:
-        raise ValueError("A Type IV filter must have zero gain at zero "
-                         "frequency.")
-
-    if nfreqs is None:
-        nfreqs = 1 + 2 ** int(ceil(log(numtaps, 2)))
-
-    if (d == 0).any():
-        # Tweak any repeated values in freq so that interp works.
-        freq = np.array(freq, copy=True)
-        eps = np.finfo(float).eps * nyq
-        for k in range(len(freq) - 1):
-            if freq[k] == freq[k + 1]:
-                freq[k] = freq[k] - eps
-                freq[k + 1] = freq[k + 1] + eps
-        # Check if freq is strictly increasing after tweak
-        d = np.diff(freq)
-        if (d <= 0).any():
-            raise ValueError("freq cannot contain numbers that are too close "
-                             "(within eps * (fs/2): "
-                             f"{eps}) to a repeated value")
-
-    # Linearly interpolate the desired response on a uniform mesh `x`.
-    x = np.linspace(0.0, nyq, nfreqs)
-    fx = np.interp(x, freq, gain)
-
-    # Adjust the phases of the coefficients so that the first `ntaps` of the
-    # inverse FFT are the desired filter coefficients.
-    shift = np.exp(-(numtaps - 1) / 2. * 1.j * np.pi * x / nyq)
-    if ftype > 2:
-        shift *= 1j
-
-    fx2 = fx * shift
-
-    # Use irfft to compute the inverse FFT.
-    out_full = irfft(fx2)
-
-    if window is not None:
-        # Create the window to apply to the filter coefficients.
-        from .windows import get_window
-        wind = get_window(window, numtaps, fftbins=False)
-    else:
-        wind = 1
-
-    # Keep only the first `numtaps` coefficients in `out`, and multiply by
-    # the window.
-    out = out_full[:numtaps] * wind
-
-    if ftype == 3:
-        out[out.size // 2] = 0.0
-
-    return out
+    warnings.warn(
+        "firwin2 is deprecated; use firwin(..., method='multiband') instead.",
+        DeprecationWarning, stacklevel=2)
+    return firwin(numtaps,
+                  cutoff=None,
+                  freq=freq,
+                  gain=gain,
+                  nfreqs=nfreqs,
+                  window=window,
+                  antisymmetric=antisymmetric,
+                  fs=fs,
+                  method='multiband')
 
 
 def remez(numtaps, bands, desired, *, weight=None, type='bandpass',
@@ -729,13 +809,6 @@ def remez(numtaps, bands, desired, *, weight=None, type='bandpass',
 
     References
     ----------
-    .. [1] J. H. McClellan and T. W. Parks, "A unified approach to the
-           design of optimum FIR linear phase digital filters",
-           IEEE Trans. Circuit Theory, vol. CT-20, pp. 697-701, 1973.
-    .. [2] J. H. McClellan, T. W. Parks and L. R. Rabiner, "A Computer
-           Program for Designing Optimum FIR Linear Phase Digital
-           Filters", IEEE Trans. Audio Electroacoust., vol. AU-21,
-           pp. 506-525, 1973.
 
     Examples
     --------
